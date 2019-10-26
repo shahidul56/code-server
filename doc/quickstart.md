@@ -7,15 +7,6 @@
 ## Usage
 Run `code-server --help` to view available options.
 
-### Encrypting traffic with HTTPS
-To encrypt the traffic between the browser and server use `code-server --cert`
-followed by the path to your certificate. Additionally, you can use certificate
-keys with `--cert-key` followed by the path to your key. If you pass `--cert`
-without any path code-server will generate a self-signed certificate.
-
-You can use [Let's Encrypt](https://letsencrypt.org/) to get an SSL certificate
-for free.
-
 ### Nginx Reverse Proxy
 The trailing slashes are important.
 
@@ -59,27 +50,23 @@ In some cases you might need to run code-server automatically once the host star
 
 ```ini
 [Unit]
-
-Description=VSCode in a browser
-
+Description=Code Server IDE
 After=network.target
 
 [Service]
-
 Type=simple
-
-ExecStart=/usr/bin/code-server $(pwd)
-
-WorkingDirectory=$HOME/projects
-
-ExecStop=/sbin/start-stop-daemon --stop -x /usr/bin/code-server
-
+User=<USER>
+EnvironmentFile=$HOME/.profile
+WorkingDirectory=$HOME
 Restart=on-failure
+RestartSec=10
 
-User=1000
+ExecStart=<PATH TO BINARY> $(pwd)
+
+StandardOutput=file:/var/log/code-server-output.log
+StandardError=file:/var/log/code-server-error.log
 
 [Install]
-
 WantedBy=multi-user.target
 ```
 

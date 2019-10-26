@@ -5,14 +5,13 @@ import { setUnexpectedErrorHandler } from "vs/base/common/errors";
 import { main as vsCli } from "vs/code/node/cliProcessMain";
 import { validatePaths } from "vs/code/node/paths";
 import { ParsedArgs } from "vs/platform/environment/common/environment";
-import { buildHelpMessage, buildVersionMessage, Option as VsOption, options as vsOptions } from "vs/platform/environment/node/argv";
+import { buildHelpMessage, buildVersionMessage, Option as VsOption, OPTIONS, OptionDescriptions } from "vs/platform/environment/node/argv";
 import { parseMainProcessArgv } from "vs/platform/environment/node/argvHelper";
-import pkg from "vs/platform/product/node/package";
-import product from "vs/platform/product/node/product";
-import { ipcMain } from "vs/server/src/ipc";
-import { enableCustomMarketplace } from "vs/server/src/marketplace";
-import { MainServer } from "vs/server/src/server";
-import { AuthType, buildAllowedMessage, enumToArray, FormatType, generateCertificate, generatePassword, localRequire, open, unpackExecutables } from "vs/server/src/util";
+import product from "vs/platform/product/common/product";
+import { ipcMain } from "vs/server/src/node/ipc";
+import { enableCustomMarketplace } from "vs/server/src/node/marketplace";
+import { MainServer } from "vs/server/src/node/server";
+import { AuthType, buildAllowedMessage, enumToArray, FormatType, generateCertificate, generatePassword, localRequire, open, unpackExecutables } from "vs/server/src/node/util";
 
 const { logger } = localRequire<typeof import("@coder/logger/out/index")>("@coder/logger/out/index");
 setUnexpectedErrorHandler((error) => logger.warn(error.message));
@@ -24,7 +23,7 @@ interface Args extends ParsedArgs {
 	"cert-key"?: string;
 	format?: string;
 	host?: string;
-	open?: string;
+	open?: boolean;
 	port?: string;
 	socket?: string;
 }
@@ -35,14 +34,9 @@ interface Option extends VsOption {
 }
 
 const getArgs = (): Args => {
-	const options = vsOptions as Option[];
-	// The last item is _ which is like -- so our options need to come before it.
-	const last = options.pop()!;
-
 	// Remove options that won't work or don't make sense.
-	let i = options.length;
-	while (i--) {
-		switch (options[i].id) {
+	for (let key in OPTIONS) {
+		switch (key) {
 			case "add":
 			case "diff":
 			case "file-uri":
@@ -57,24 +51,21 @@ const getArgs = (): Args => {
 			case "prof-startup":
 			case "inspect-extensions":
 			case "inspect-brk-extensions":
-				options.splice(i, 1);
+				delete OPTIONS[key];
 				break;
 		}
 	}
 
-	options.push({ id: "base-path", type: "string", cat: "o", description: "Base path of the URL at which code-server is hosted (used for login redirects)." });
-	options.push({ id: "cert", type: "string", cat: "o", description: "Path to certificate. If the path is omitted, both this and --cert-key will be generated." });
-	options.push({ id: "cert-key", type: "string", cat: "o", description: "Path to the certificate's key if one was provided." });
-	options.push({ id: "extra-builtin-extensions-dir", type: "string", cat: "o", description: "Path to an extra builtin extension directory." });
-	options.push({ id: "extra-extensions-dir", type: "string", cat: "o", description: "Path to an extra user extension directory." });
-	options.push({ id: "format", type: "string", cat: "o", description: `Format for the version. ${buildAllowedMessage(FormatType)}.` });
-	options.push({ id: "host", type: "string", cat: "o", description: "Host for the server." });
-	options.push({ id: "auth", type: "string", cat: "o", description: `The type of authentication to use. ${buildAllowedMessage(AuthType)}.` });
-	options.push({ id: "open", type: "boolean", cat: "o", description: "Open in the browser on startup." });
-	options.push({ id: "port", type: "string", cat: "o", description: "Port for the main server." });
-	options.push({ id: "socket", type: "string", cat: "o", description: "Listen on a socket instead of host:port." });
-
-	options.push(last);
+	const options = OPTIONS as OptionDescriptions<Required<Args>>;
+	options["base-path"] = { type: "string", cat: "o", description: "Base path of the URL at which code-server is hosted (used for login redirects)." };
+	options["cert"] = { type: "string", cat: "o", description: "Path to certificate. If the path is omitted, both this and --cert-key will be generated." };
+	options["cert-key"] = { type: "string", cat: "o", description: "Path to the certificate's key if one was provided." };
+	options["format"] = { type: "string", cat: "o", description: `Format for the version. ${buildAllowedMessage(FormatType)}.` };
+	options["host"] = { type: "string", cat: "o", description: "Host for the server." };
+	options["auth"] = { type: "string", cat: "o", description: `The type of authentication to use. ${buildAllowedMessage(AuthType)}.` };
+	options["open"] = { type: "boolean", cat: "o", description: "Open in the browser on startup." };
+	options["port"] = { type: "string", cat: "o", description: "Port for the main server." };
+	options["socket"] = { type: "string", cat: "o", description: "Listen on a socket instead of host:port." };
 
 	const args = parseMainProcessArgv(process.argv);
 	if (!args["user-data-dir"]) {
@@ -84,6 +75,10 @@ const getArgs = (): Args => {
 		args["extensions-dir"] = path.join(args["user-data-dir"], "extensions");
 	}
 
+	if (!args.verbose && !args.log && process.env.LOG_LEVEL) {
+		args.log = process.env.LOG_LEVEL;
+	}
+
 	return validatePaths(args);
 };
 
@@ -91,7 +86,7 @@ const startVscode = async (): Promise<void | void[]> => {
 	const args = getArgs();
 	const extra = args["_"] || [];
 	const options = {
-		auth: args.auth,
+		auth: args.auth || AuthType.Password,
 		basePath: args["base-path"],
 		cert: args.cert,
 		certKey: args["cert-key"],
@@ -100,9 +95,9 @@ const startVscode = async (): Promise<void | void[]> => {
 		password: process.env.PASSWORD,
 	};
 
-	if (options.auth && enumToArray(AuthType).filter((t) => t === options.auth).length === 0) {
+	if (enumToArray(AuthType).filter((t) => t === options.auth).length === 0) {
 		throw new Error(`'${options.auth}' is not a valid authentication type.`);
-	} else if (options.auth && !options.password) {
+	} else if (options.auth === "password" && !options.password) {
 		options.password = await generatePassword();
 	}
 
@@ -130,10 +125,13 @@ const startVscode = async (): Promise<void | void[]> => {
 	]);
 	logger.info(`Server listening on ${serverAddress}`);
 
-	if (options.auth && !process.env.PASSWORD) {
+	if (options.auth === "password" && !process.env.PASSWORD) {
 		logger.info(`  - Password is ${options.password}`);
-		logger.info("  - To use your own password, set the PASSWORD environment variable");
-	} else if (options.auth) {
+		logger.info("    - To use your own password, set the PASSWORD environment variable");
+		if (!args.auth) {
+			logger.info("    - To disable use `--auth none`");
+		}
+	} else if (options.auth === "password") {
 		logger.info("  - Using custom password for authentication");
 	} else {
 		logger.info("  - No authentication");
@@ -161,19 +159,19 @@ const startCli = (): boolean | Promise<void> => {
 	const args = getArgs();
 	if (args.help) {
 		const executable = `${product.applicationName}${os.platform() === "win32" ? ".exe" : ""}`;
-		console.log(buildHelpMessage(product.nameLong, executable, pkg.codeServerVersion, undefined, false));
+		console.log(buildHelpMessage(product.nameLong, executable, product.codeServerVersion, OPTIONS, false));
 		return true;
 	}
 
 	if (args.version) {
 		if (args.format === "json") {
 			console.log(JSON.stringify({
-				codeServerVersion: pkg.codeServerVersion,
+				codeServerVersion: product.codeServerVersion,
 				commit: product.commit,
-				vscodeVersion: pkg.version,
+				vscodeVersion: product.version,
 			}));
 		} else {
-			buildVersionMessage(pkg.codeServerVersion, product.commit).split("\n").map((line) => logger.info(line));
+			buildVersionMessage(product.codeServerVersion, product.commit).split("\n").map((line) => logger.info(line));
 		}
 		return true;
 	}
@@ -250,13 +248,19 @@ const main = async(): Promise<boolean | void | void[]> => {
 	return startCli() || new WrapperProcess().start();
 };
 
+const exit = process.exit;
+process.exit = function (code?: number) {
+	const err = new Error(`process.exit() was prevented: ${code || "unknown code"}.`);
+	console.warn(err.stack);
+} as (code?: number) => never;
+
 // It's possible that the pipe has closed (for example if you run code-server
 // --version | head -1). Assume that means we're done.
 if (!process.stdout.isTTY) {
-	process.stdout.on("error", () => process.exit());
+	process.stdout.on("error", () => exit());
 }
 
 main().catch((error) => {
 	logger.error(error.message);
-	process.exit(typeof error.code === "number" ? error.code : 1);
+	exit(typeof error.code === "number" ? error.code : 1);
 });

@@ -14,6 +14,7 @@ import { mkdirp } from "vs/base/node/pfs";
 
 export enum AuthType {
 	Password = "password",
+	None = "none",
 }
 
 export enum FormatType {
@@ -53,7 +54,7 @@ export const generateCertificate = async (): Promise<{ cert: string, certKey: st
 	return paths;
 };
 
-export const uriTransformerPath = getPathFromAmdModule(require, "vs/server/src/uriTransformer");
+export const uriTransformerPath = getPathFromAmdModule(require, "vs/server/src/node/uriTransformer");
 export const getUriTransformer = (remoteAuthority: string): URITransformer => {
 	const rawURITransformerFactory = <any>require.__$__nodeRequire(uriTransformerPath);
 	const rawURITransformer = <IRawURITransformer>rawURITransformerFactory(remoteAuthority);
@@ -127,7 +128,7 @@ export const enumToArray = (t: any): string[] => {
 
 export const buildAllowedMessage = (t: any): string => {
 	const values = enumToArray(t);
-	return `Allowed value${values.length === 1 ? " is" : "s are"} ${values.map((t) => `'${t}'`).join(",")}`;
+	return `Allowed value${values.length === 1 ? " is" : "s are"} ${values.map((t) => `'${t}'`).join(", ")}`;
 };
 
 /**
@@ -135,5 +136,5 @@ export const buildAllowedMessage = (t: any): string => {
  * at the root for Node modules.
  */
 export const localRequire = <T>(modulePath: string): T => {
-	return require.__$__nodeRequire(path.resolve(__dirname, "../node_modules", modulePath));
+	return require.__$__nodeRequire(path.resolve(__dirname, "../../node_modules", modulePath));
 };

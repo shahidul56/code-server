@@ -12,12 +12,12 @@ import { ExtensionIdentifier, IExtensionDescription } from "vs/platform/extensio
 import { FileDeleteOptions, FileOpenOptions, FileOverwriteOptions, FileType, IStat, IWatchOptions } from "vs/platform/files/common/files";
 import { DiskFileSystemProvider } from "vs/platform/files/node/diskFileSystemProvider";
 import { ILogService } from "vs/platform/log/common/log";
-import pkg from "vs/platform/product/node/package";
-import product from "vs/platform/product/node/product";
+import product from "vs/platform/product/common/product";
 import { IRemoteAgentEnvironment } from "vs/platform/remote/common/remoteAgentEnvironment";
 import { ITelemetryService } from "vs/platform/telemetry/common/telemetry";
-import { getTranslations } from "vs/server/src/nls";
-import { getUriTransformer } from "vs/server/src/util";
+import { INodeProxyService } from "vs/server/src/common/nodeProxy";
+import { getTranslations } from "vs/server/src/node/nls";
+import { getUriTransformer, localRequire } from "vs/server/src/node/util";
 import { ExtensionScanner, ExtensionScannerInput } from "vs/workbench/services/extensions/node/extensionPoints";
 
 /**
@@ -227,7 +227,7 @@ export class ExtensionEnvironmentChannel implements IServerChannel {
 		const scanMultiple = (isBuiltin: boolean, isUnderDevelopment: boolean, paths: string[]): Promise<IExtensionDescription[][]> => {
 			return Promise.all(paths.map((path) => {
 				return ExtensionScanner.scanExtensions(new ExtensionScannerInput(
-					pkg.version,
+					product.version,
 					product.commit,
 					locale,
 					!!process.env.VSCODE_DEV,
@@ -272,5 +272,42 @@ export class ExtensionEnvironmentChannel implements IServerChannel {
 
 	private async disableTelemetry(): Promise<void> {
 		this.telemetry.setEnabled(false);
+	}
+}
+
+export class NodeProxyService implements INodeProxyService {
+	public _serviceBrand = undefined;
+
+	public readonly server: import("@coder/node-browser/out/server/server").Server;
+
+	private readonly _onMessage = new Emitter<string>();
+	public readonly onMessage = this._onMessage.event;
+	private readonly _$onMessage = new Emitter<string>();
+	public readonly $onMessage = this._$onMessage.event;
+	public readonly _onDown = new Emitter<void>();
+	public readonly onDown = this._onDown.event;
+	public readonly _onUp = new Emitter<void>();
+	public readonly onUp = this._onUp.event;
+
+	// Unused because the server connection will never permanently close.
+	private readonly _onClose = new Emitter<void>();
+	public readonly onClose = this._onClose.event;
+
+	public constructor() {
+		// TODO: down/up
+		const { Server } = localRequire<typeof import("@coder/node-browser/out/server/server")>("@coder/node-browser/out/server/server");
+		this.server = new Server({
+			onMessage: this.$onMessage,
+			onClose: this.onClose,
+			onDown: this.onDown,
+			onUp: this.onUp,
+			send: (message: string): void => {
+				this._onMessage.fire(message);
+			}
+		});
+	}
+
+	public send(message: string): void {
+		this._$onMessage.fire(message);
 	}
 }

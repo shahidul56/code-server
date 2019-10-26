@@ -17,13 +17,12 @@ import { generateUuid } from "vs/base/common/uuid";
 import { getMachineId } from 'vs/base/node/id';
 import { NLSConfiguration } from "vs/base/node/languagePacks";
 import { mkdirp, rimraf } from "vs/base/node/pfs";
-import { ClientConnectionEvent, IPCServer, StaticRouter } from "vs/base/parts/ipc/common/ipc";
+import { ClientConnectionEvent, IPCServer } from "vs/base/parts/ipc/common/ipc";
+import { createChannelReceiver } from "vs/base/parts/ipc/node/ipc";
 import { LogsDataCleaner } from "vs/code/electron-browser/sharedProcess/contrib/logsDataCleaner";
 import { IConfigurationService } from "vs/platform/configuration/common/configuration";
 import { ConfigurationService } from "vs/platform/configuration/node/configurationService";
 import { ExtensionHostDebugBroadcastChannel } from "vs/platform/debug/common/extensionHostDebugIpc";
-import { IDialogService } from "vs/platform/dialogs/common/dialogs";
-import { DialogChannelClient } from "vs/platform/dialogs/node/dialogIpc";
 import { IEnvironmentService, ParsedArgs } from "vs/platform/environment/common/environment";
 import { EnvironmentService } from "vs/platform/environment/node/environmentService";
 import { ExtensionGalleryService } from "vs/platform/extensionManagement/common/extensionGalleryService";
@@ -38,13 +37,11 @@ import { InstantiationService } from "vs/platform/instantiation/common/instantia
 import { ServiceCollection } from "vs/platform/instantiation/common/serviceCollection";
 import { ILocalizationsService } from "vs/platform/localizations/common/localizations";
 import { LocalizationsService } from "vs/platform/localizations/node/localizations";
-import { LocalizationsChannel } from "vs/platform/localizations/node/localizationsIpc";
 import { getLogLevel, ILogService } from "vs/platform/log/common/log";
-import { LogLevelSetterChannel } from "vs/platform/log/common/logIpc";
+import { LoggerChannel } from "vs/platform/log/common/logIpc";
 import { SpdLogService } from "vs/platform/log/node/spdlogService";
-import { IProductService } from "vs/platform/product/common/product";
-import pkg from "vs/platform/product/node/package";
-import product from "vs/platform/product/node/product";
+import product from 'vs/platform/product/common/product';
+import { IProductService } from "vs/platform/product/common/productService";
 import { ConnectionType, ConnectionTypeRequest } from "vs/platform/remote/common/remoteAgentConnection";
 import { REMOTE_FILE_SYSTEM_CHANNEL_NAME } from "vs/platform/remote/common/remoteAgentFileSystemChannel";
 import { IRequestService } from "vs/platform/request/common/request";
@@ -56,15 +53,16 @@ import { ITelemetryServiceConfig, TelemetryService } from "vs/platform/telemetry
 import { combinedAppender, LogAppender, NullTelemetryService } from "vs/platform/telemetry/common/telemetryUtils";
 import { AppInsightsAppender } from "vs/platform/telemetry/node/appInsightsAppender";
 import { resolveCommonProperties } from "vs/platform/telemetry/node/commonProperties";
-import { UpdateChannel } from "vs/platform/update/node/updateIpc";
-import { ExtensionEnvironmentChannel, FileProviderChannel } from "vs/server/src/channel";
-import { Connection, ExtensionHostConnection, ManagementConnection } from "vs/server/src/connection";
-import { TelemetryClient } from "vs/server/src/insights";
-import { getLocaleFromConfig, getNlsConfiguration } from "vs/server/src/nls";
-import { Protocol } from "vs/server/src/protocol";
-import { TelemetryChannel } from "vs/server/src/telemetry";
-import { UpdateService } from "vs/server/src/update";
-import { AuthType, getMediaMime, getUriTransformer, localRequire, tmpdir } from "vs/server/src/util";
+import { UpdateChannel } from "vs/platform/update/electron-main/updateIpc";
+import { INodeProxyService, NodeProxyChannel } from "vs/server/src/common/nodeProxy";
+import { TelemetryChannel } from "vs/server/src/common/telemetry";
+import { ExtensionEnvironmentChannel, FileProviderChannel, NodeProxyService } from "vs/server/src/node/channel";
+import { Connection, ExtensionHostConnection, ManagementConnection } from "vs/server/src/node/connection";
+import { TelemetryClient } from "vs/server/src/node/insights";
+import { getLocaleFromConfig, getNlsConfiguration } from "vs/server/src/node/nls";
+import { Protocol } from "vs/server/src/node/protocol";
+import { UpdateService } from "vs/server/src/node/update";
+import { AuthType, getMediaMime, getUriTransformer, localRequire, tmpdir } from "vs/server/src/node/util";
 import { RemoteExtensionLogFileName } from "vs/workbench/services/remote/common/remoteAgentService";
 import { IWorkbenchConstructionOptions } from "vs/workbench/workbench.web.api";
 
@@ -81,8 +79,9 @@ export enum HttpCode {
 }
 
 export interface Options {
-	WORKBENCH_WEB_CONGIGURATION: IWorkbenchConstructionOptions;
+	WORKBENCH_WEB_CONFIGURATION: IWorkbenchConstructionOptions & { folderUri?: UriComponents, workspaceUri?: UriComponents };
 	REMOTE_USER_DATA_URI: UriComponents | URI;
+	PRODUCT_CONFIGURATION: Partial<IProductService>;
 	NLS_CONFIGURATION: NLSConfiguration;
 }
 
@@ -111,7 +110,7 @@ export class HttpError extends Error {
 }
 
 export interface ServerOptions {
-	readonly auth?: AuthType;
+	readonly auth: AuthType;
 	readonly basePath?: string;
 	readonly connectionToken?: string;
 	readonly cert?: string;
@@ -125,7 +124,7 @@ export interface ServerOptions {
 
 export abstract class Server {
 	protected readonly server: http.Server | https.Server;
-	protected rootPath = path.resolve(__dirname, "../../../..");
+	protected rootPath = path.resolve(__dirname, "../../../../..");
 	protected serverRoot = path.join(this.rootPath, "/out/vs/server/src");
 	protected readonly allowedRequestPaths: string[] = [this.rootPath];
 	private listenPromise: Promise<string> | undefined;
@@ -134,7 +133,7 @@ export abstract class Server {
 
 	public constructor(options: ServerOptions) {
 		this.options = {
-			host: options.auth && options.cert ? "0.0.0.0" : "localhost",
+			host: options.auth === "password" && options.cert ? "0.0.0.0" : "localhost",
 			...options,
 			basePath: options.basePath ? options.basePath.replace(/\/+$/, "") : "",
 		};
@@ -194,9 +193,14 @@ export abstract class Server {
 		return { content: await util.promisify(fs.readFile)(filePath), filePath };
 	}
 
+	protected async getAnyResource(...parts: string[]): Promise<Response> {
+		const filePath = path.join(...parts);
+		return { content: await util.promisify(fs.readFile)(filePath), filePath };
+	}
+
 	protected async getTarredResource(...parts: string[]): Promise<Response> {
 		const filePath = this.ensureAuthorizedFilePath(...parts);
-		return { stream: tarFs.pack(filePath), filePath, mime: "application/tar" };
+		return { stream: tarFs.pack(filePath), filePath, mime: "application/tar", cache: true };
 	}
 
 	protected ensureAuthorizedFilePath(...parts: string[]): string {
@@ -270,7 +274,7 @@ export abstract class Server {
 		base = path.normalize(base);
 		requestPath = path.normalize(requestPath || "/index.html");
 
-		if (base !== "/login" || !this.options.auth || requestPath !== "/index.html") {
+		if (base !== "/login" || this.options.auth !== "password" || requestPath !== "/index.html") {
 			this.ensureGet(request);
 		}
 
@@ -279,7 +283,7 @@ export abstract class Server {
 		// without adding query parameters which have their own issues.
 		// REVIEW: Discuss whether this is the best option; this is sort of a quick
 		// hack almost to get caching in the meantime but it does work pretty well.
-		if (/^\/static-.+/.test(base)) {
+		if (/^\/static-/.test(base)) {
 			base = "/static";
 		}
 
@@ -301,7 +305,7 @@ export abstract class Server {
 				response.cache = true;
 				return response;
 			case "/login":
-				if (!this.options.auth || requestPath !== "/index.html") {
+				if (this.options.auth !== "password" || requestPath !== "/index.html") {
 					throw new HttpError("Not found", HttpCode.NotFound);
 				}
 				return this.tryLogin(request);
@@ -360,7 +364,7 @@ export abstract class Server {
 			if (this.authenticate(request, data)) {
 				return {
 					redirect: "/",
-					headers: {"Set-Cookie": `password=${data.password}` }
+					headers: { "Set-Cookie": `password=${data.password}` }
 				};
 			}
 			console.error("Failed login attempt", JSON.stringify({
@@ -376,7 +380,7 @@ export abstract class Server {
 	}
 
 	private async getLogin(error: string = "", payload?: LoginPayload): Promise<Response> {
-		const filePath = path.join(this.serverRoot, "login/index.html");
+		const filePath = path.join(this.serverRoot, "browser/login.html");
 		const content = (await util.promisify(fs.readFile)(filePath, "utf8"))
 			.replace("{{ERROR}}", error)
 			.replace("display:none", error ? "display:block" : "display:none")
@@ -422,7 +426,7 @@ export abstract class Server {
 	}
 
 	private authenticate(request: http.IncomingMessage, payload?: LoginPayload): boolean {
-		if (!this.options.auth) {
+		if (this.options.auth !== "password") {
 			return true;
 		}
 		const safeCompare = localRequire<typeof import("safe-compare")>("safe-compare/index");
@@ -444,6 +448,15 @@ export abstract class Server {
 	}
 }
 
+interface StartPath {
+	path?: string[] | string;
+	workspace?: boolean;
+}
+
+interface Settings {
+	lastVisited?: StartPath;
+}
+
 export class MainServer extends Server {
 	public readonly _onDidClientConnect = new Emitter<ClientConnectionEvent>();
 	public readonly onDidClientConnect = this._onDidClientConnect.event;
@@ -459,6 +472,8 @@ export class MainServer extends Server {
 	private proxyPipe = path.join(tmpdir, "tls-proxy");
 	private _proxyServer?: Promise<net.Server>;
 	private readonly proxyTimeout = 5000;
+
+	private settings: Settings = {};
 
 	public constructor(options: ServerOptions, args: ParsedArgs) {
 		super(options);
@@ -513,8 +528,8 @@ export class MainServer extends Server {
 				}
 				break;
 			case "/webview":
-				if (requestPath.indexOf("/vscode-resource") === 0) {
-					return this.getResource(requestPath.replace(/^\/vscode-resource/, ""));
+				if (/^\/vscode-resource/.test(requestPath)) {
+					return this.getAnyResource(requestPath.replace(/^\/vscode-resource(\/file)?/, ""));
 				}
 				return this.getResource(
 					this.rootPath,
@@ -526,43 +541,82 @@ export class MainServer extends Server {
 	}
 
 	private async getRoot(request: http.IncomingMessage, parsedUrl: url.UrlWithParsedQuery): Promise<Response> {
-		const filePath = path.join(this.rootPath, "out/vs/code/browser/workbench/workbench.html");
-		let [content] = await Promise.all([
+		const filePath = path.join(this.serverRoot, "browser/workbench.html");
+		let [content, startPath] = await Promise.all([
 			util.promisify(fs.readFile)(filePath, "utf8"),
+			this.getFirstValidPath([
+				{ path: parsedUrl.query.workspace, workspace: true },
+				{ path: parsedUrl.query.folder },
+				(await this.readSettings()).lastVisited,
+				{ path: this.options.folderUri }
+			]),
 			this.servicesPromise,
 		]);
+
+		if (startPath) {
+			this.writeSettings({
+				lastVisited: {
+					path: startPath.uri.fsPath,
+					workspace: startPath.workspace
+				},
+			});
+		}
+
 		const logger = this.services.get(ILogService) as ILogService;
 		logger.info("request.url", `"${request.url}"`);
-		const environment = this.services.get(IEnvironmentService) as IEnvironmentService;
-		const locale = environment.args.locale || await getLocaleFromConfig(environment.userDataPath);
-		const cwd = process.env.VSCODE_CWD || process.cwd();
-		const workspacePath = parsedUrl.query.workspace as string | undefined;
-		const folderPath = !workspacePath ? parsedUrl.query.folder as string | undefined || this.options.folderUri : undefined;
+
 		const remoteAuthority = request.headers.host as string;
 		const transformer = getUriTransformer(remoteAuthority);
+
+		const environment = this.services.get(IEnvironmentService) as IEnvironmentService;
 		const options: Options = {
-			WORKBENCH_WEB_CONGIGURATION: {
-				workspaceUri: workspacePath
-					? transformer.transformOutgoing(URI.file(sanitizeFilePath(workspacePath, cwd)))
-					: undefined,
-				folderUri: folderPath
-					? transformer.transformOutgoing(URI.file(sanitizeFilePath(folderPath, cwd)))
-					: undefined,
+			WORKBENCH_WEB_CONFIGURATION: {
+				workspaceUri: startPath && startPath.workspace ? transformer.transformOutgoing(startPath.uri) : undefined,
+				folderUri: startPath && !startPath.workspace ? transformer.transformOutgoing(startPath.uri) : undefined,
 				remoteAuthority,
-				productConfiguration: product,
+				logLevel: getLogLevel(environment),
 			},
-			REMOTE_USER_DATA_URI: transformer.transformOutgoing(
-				(this.services.get(IEnvironmentService) as EnvironmentService).webUserDataHome,
-			),
-			NLS_CONFIGURATION: await getNlsConfiguration(locale, environment.userDataPath),
+			REMOTE_USER_DATA_URI: transformer.transformOutgoing(URI.file(environment.userDataPath)),
+			PRODUCT_CONFIGURATION: {
+				extensionsGallery: product.extensionsGallery,
+			},
+			NLS_CONFIGURATION: await getNlsConfiguration(environment.args.locale || await getLocaleFromConfig(environment.userDataPath), environment.userDataPath),
 		};
 
-		content = content.replace(/\/static\//g, `/static${product.commit ? `-${product.commit}` : ""}/`).replace("{{WEBVIEW_ENDPOINT}}", "");
+		content = content.replace(/{{COMMIT}}/g, product.commit || "");
 		for (const key in options) {
 			content = content.replace(`"{{${key}}}"`, `'${JSON.stringify(options[key as keyof Options])}'`);
 		}
 
 		return { content, filePath };
+	}
+
+	/**
+	 * Choose the first valid path.
+	 */
+	private async getFirstValidPath(startPaths: Array<StartPath | undefined>): Promise<{ uri: URI, workspace?: boolean} | undefined> {
+		const logger = this.services.get(ILogService) as ILogService;
+		const cwd = process.env.VSCODE_CWD || process.cwd();
+		for (let i = 0; i < startPaths.length; ++i) {
+			const startPath = startPaths[i];
+			if (!startPath) {
+				continue;
+			}
+			const paths = typeof startPath.path === "string" ? [startPath.path] : (startPath.path || []);
+			for (let j = 0; j < paths.length; ++j) {
+				const uri = URI.file(sanitizeFilePath(paths[j], cwd));
+				try {
+					const stat = await util.promisify(fs.stat)(uri.fsPath);
+					// Workspace must be a file.
+					if (!!startPath.workspace !== stat.isDirectory()) {
+						return { uri, workspace: startPath.workspace };
+					}
+				} catch (error) {
+					logger.warn(error.message);
+				}
+			}
+		}
+		return undefined;
 	}
 
 	private async connect(message: ConnectionTypeRequest, protocol: Protocol): Promise<void> {
@@ -605,6 +659,11 @@ export class MainServer extends Server {
 					this._onDidClientConnect.fire({
 						protocol, onDidClientDisconnect: connection.onClose,
 					});
+					// TODO: Need a way to match clients with a connection. For now
+					// dispose everything which only works because no extensions currently
+					// utilize long-running proxies.
+					(this.services.get(INodeProxyService) as NodeProxyService)._onUp.fire();
+					connection.onClose(() => (this.services.get(INodeProxyService) as NodeProxyService)._onDown.fire());
 				} else {
 					const buffer = protocol.readEntireBuffer();
 					connection = new ExtensionHostConnection(
@@ -645,17 +704,15 @@ export class MainServer extends Server {
 			...environmentService.extraBuiltinExtensionPaths,
 		);
 
-		this.ipc.registerChannel("loglevel", new LogLevelSetterChannel(logService));
+		this.ipc.registerChannel("logger", new LoggerChannel(logService));
 		this.ipc.registerChannel(ExtensionHostDebugBroadcastChannel.ChannelName, new ExtensionHostDebugBroadcastChannel());
 
-		const router = new StaticRouter((ctx: any) => ctx.clientId === "renderer");
 		this.services.set(ILogService, logService);
 		this.services.set(IEnvironmentService, environmentService);
 		this.services.set(IConfigurationService, new SyncDescriptor(ConfigurationService, [environmentService.machineSettingsResource]));
 		this.services.set(IRequestService, new SyncDescriptor(RequestService));
 		this.services.set(IFileService, fileService);
 		this.services.set(IProductService, { _serviceBrand: undefined, ...product });
-		this.services.set(IDialogService, new DialogChannelClient(this.ipc.getChannel("dialog", router)));
 		this.services.set(IExtensionGalleryService, new SyncDescriptor(ExtensionGalleryService));
 		this.services.set(IExtensionManagementService, new SyncDescriptor(ExtensionManagementService));
 
@@ -666,7 +723,7 @@ export class MainServer extends Server {
 					new LogAppender(logService),
 				),
 				commonProperties: resolveCommonProperties(
-					product.commit, pkg.codeServerVersion, await getMachineId(),
+					product.commit, product.codeServerVersion, await getMachineId(),
 					[], environmentService.installSourcePath, "code-server",
 				),
 				piiPaths: this.allowedRequestPaths,
@@ -677,28 +734,25 @@ export class MainServer extends Server {
 
 		await new Promise((resolve) => {
 			const instantiationService = new InstantiationService(this.services);
-			const localizationService = instantiationService.createInstance(LocalizationsService);
-			this.services.set(ILocalizationsService, localizationService);
-			this.ipc.registerChannel("localizations", new LocalizationsChannel(localizationService));
+			this.services.set(ILocalizationsService, instantiationService.createInstance(LocalizationsService));
+			this.services.set(INodeProxyService, instantiationService.createInstance(NodeProxyService));
+
 			instantiationService.invokeFunction(() => {
 				instantiationService.createInstance(LogsDataCleaner);
-
-				const extensionsService = this.services.get(IExtensionManagementService) as IExtensionManagementService;
 				const telemetryService = this.services.get(ITelemetryService) as ITelemetryService;
-
-				const extensionsChannel = new ExtensionManagementChannel(extensionsService, (context) => getUriTransformer(context.remoteAuthority));
-				const extensionsEnvironmentChannel = new ExtensionEnvironmentChannel(environmentService, logService, telemetryService, this.options.connectionToken || "");
-				const fileChannel = new FileProviderChannel(environmentService, logService);
-				const requestChannel = new RequestChannel(this.services.get(IRequestService) as IRequestService);
-				const telemetryChannel = new TelemetryChannel(telemetryService);
-				const updateChannel = new UpdateChannel(instantiationService.createInstance(UpdateService));
-
-				this.ipc.registerChannel("extensions", extensionsChannel);
-				this.ipc.registerChannel("remoteextensionsenvironment", extensionsEnvironmentChannel);
-				this.ipc.registerChannel("request", requestChannel);
-				this.ipc.registerChannel("telemetry", telemetryChannel);
-				this.ipc.registerChannel("update", updateChannel);
-				this.ipc.registerChannel(REMOTE_FILE_SYSTEM_CHANNEL_NAME, fileChannel);
+				this.ipc.registerChannel("extensions", new ExtensionManagementChannel(
+					this.services.get(IExtensionManagementService) as IExtensionManagementService,
+					(context) => getUriTransformer(context.remoteAuthority),
+				));
+				this.ipc.registerChannel("remoteextensionsenvironment", new ExtensionEnvironmentChannel(
+					environmentService, logService, telemetryService, this.options.connectionToken || "",
+				));
+				this.ipc.registerChannel("request", new RequestChannel(this.services.get(IRequestService) as IRequestService));
+				this.ipc.registerChannel("telemetry", new TelemetryChannel(telemetryService));
+				this.ipc.registerChannel("nodeProxy", new NodeProxyChannel(this.services.get(INodeProxyService) as INodeProxyService));
+				this.ipc.registerChannel("localizations", createChannelReceiver(this.services.get(ILocalizationsService) as ILocalizationsService));
+				this.ipc.registerChannel("update", new UpdateChannel(instantiationService.createInstance(UpdateService)));
+				this.ipc.registerChannel(REMOTE_FILE_SYSTEM_CHANNEL_NAME, new FileProviderChannel(environmentService, logService));
 				resolve(new ErrorTelemetry(telemetryService));
 			});
 		});
@@ -784,5 +838,42 @@ export class MainServer extends Server {
 			path = `${basePath}-${++i}`;
 		}
 		return path;
+	}
+
+	/**
+	 * Return the file path for Coder settings.
+	 */
+	private get settingsPath(): string {
+		const environment = this.services.get(IEnvironmentService) as IEnvironmentService;
+		return path.join(environment.userDataPath, "coder.json");
+	}
+
+	/**
+	 * Read settings from the file. On a failure return last known settings and
+	 * log a warning.
+	 *
+	 */
+	private async readSettings(): Promise<Settings> {
+		try {
+			const raw = (await util.promisify(fs.readFile)(this.settingsPath, "utf8")).trim();
+			this.settings = raw ? JSON.parse(raw) : {};
+		} catch (error) {
+			if (error.code !== "ENOENT") {
+				(this.services.get(ILogService) as ILogService).warn(error.message);
+			}
+		}
+		return this.settings;
+	}
+
+	/**
+	 * Write settings combined with current settings. On failure log a warning.
+	 */
+	private async writeSettings(newSettings: Partial<Settings>): Promise<void> {
+		this.settings = { ...this.settings, ...newSettings };
+		try {
+			await util.promisify(fs.writeFile)(this.settingsPath, JSON.stringify(this.settings));
+		} catch (error) {
+			(this.services.get(ILogService) as ILogService).warn(error.message);
+		}
 	}
 }
